@@ -1,0 +1,128 @@
+name: fork-sync
+on:
+  workflow_call:
+    inputs:
+      upstream: { required: true, type: string } # owner/repo
+      mode: { required: true, type: string } # rebase | merge | notify
+      tag_pattern: { required: true, type: string } # grep -E pattern for release tags
+      base_marker: { required: false, type: string, default: '.ktn-base' }
+      deploy_branch: { required: false, type: string, default: 'ktn' }
+      dry_run: { required: false, type: boolean, default: false }
+    secrets:
+      NTFY_URL: { required: true }
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      new_tag: ${{ steps.d.outputs.new_tag }}
+      current: ${{ steps.d.outputs.current }}
+      has_new: ${{ steps.d.outputs.has_new }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          {
+            ref: "${{ inputs.mode != 'notify' && inputs.deploy_branch || github.event.repository.default_branch }}",
+          }
+      - id: d
+        env: { GH_TOKEN: '${{ github.token }}' }
+        run: |
+          latest=$(git ls-remote --tags --refs "https://github.com/${{ inputs.upstream }}.git" \
+            | awk -F/ '{print $NF}' | grep -E '${{ inputs.tag_pattern }}' | sort -V | tail -1)
+          if [ "${{ inputs.mode }}" = "notify" ]; then
+            current=$(gh variable get FORK_SYNC_LAST -R "$GITHUB_REPOSITORY" 2>/dev/null || echo "")
+          else
+            current=$(cat '${{ inputs.base_marker }}')
+          fi
+          echo "new_tag=$latest"  >> "$GITHUB_OUTPUT"
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          if [ -n "$latest" ] && [ "$latest" != "$current" ]; then
+            echo "has_new=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_new=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  attempt:
+    needs: detect
+    if: needs.detect.outputs.has_new == 'true' && inputs.mode != 'notify'
+    runs-on: ubuntu-latest
+    outputs:
+      outcome: ${{ steps.sync.outputs.outcome }}
+      detail: ${{ steps.sync.outputs.detail }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: '${{ inputs.deploy_branch }}', fetch-depth: 0 }
+      - id: sync
+        env: { GH_TOKEN: '${{ github.token }}' }
+        run: |
+          set -e
+          git config user.name ktn-bot
+          git config user.email ktn-bot@users.noreply.github.com
+          git remote add upstream "https://github.com/${{ inputs.upstream }}.git"
+          git fetch upstream --tags --quiet
+          NEW='${{ needs.detect.outputs.new_tag }}'; CUR='${{ needs.detect.outputs.current }}'
+          BR="sync/$NEW"
+          if [ "$(gh pr list --head "$BR" --state open --json number --jq length)" != "0" ]; then
+            echo "outcome=skipped" >> "$GITHUB_OUTPUT"; echo "detail=PR already open" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          ok=true
+          if [ "${{ inputs.mode }}" = "rebase" ]; then
+            git rev-list --reverse --no-merges HEAD --not "$CUR" "$NEW" > /tmp/carry.txt
+            git checkout -B "$BR" "$NEW"
+            while read -r c; do
+              if ! git cherry-pick -x --empty=drop "$c" >/dev/null 2>&1; then
+                files=$(git diff --name-only --diff-filter=U | tr '\n' ' ')
+                git cherry-pick --abort; ok=false; break
+              fi
+            done < /tmp/carry.txt
+          else
+            git checkout -B "$BR"
+            if ! git merge --no-ff --no-edit "$NEW"; then
+              files=$(git diff --name-only --diff-filter=U | tr '\n' ' ')
+              git merge --abort; ok=false
+            fi
+          fi
+          if [ "$ok" = true ]; then
+            echo "$NEW" > '${{ inputs.base_marker }}'
+            git add '${{ inputs.base_marker }}'; git commit -m "ktn: track $NEW"
+            if [ "${{ inputs.dry_run }}" = "true" ]; then
+              echo "outcome=dry-clean" >> "$GITHUB_OUTPUT"; echo "detail=clean (dry run, not pushed)" >> "$GITHUB_OUTPUT"
+            else
+              git push -f origin "$BR"
+              url=$(gh pr create --base '${{ inputs.deploy_branch }}' --head "$BR" \
+                --title "ktn: sync $NEW" \
+                --body "Automated ${{ inputs.mode }} of carried patches onto $NEW. Build gate runs on this PR. Merging deploys.")
+              echo "outcome=clean" >> "$GITHUB_OUTPUT"; echo "detail=$url" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "outcome=conflict" >> "$GITHUB_OUTPUT"; echo "detail=conflicts in: $files" >> "$GITHUB_OUTPUT"
+          fi
+
+  record:
+    needs: detect
+    if: needs.detect.outputs.has_new == 'true' && inputs.mode == 'notify'
+    runs-on: ubuntu-latest
+    steps:
+      - env: { GH_TOKEN: '${{ github.token }}' }
+        run: gh variable set FORK_SYNC_LAST -R "$GITHUB_REPOSITORY" --body '${{ needs.detect.outputs.new_tag }}'
+
+  notify:
+    needs: [detect, attempt, record]
+    if: always() && needs.detect.outputs.has_new == 'true'
+    runs-on: [self-hosted, ktn]
+    steps:
+      - env:
+          NTFY_URL: ${{ secrets.NTFY_URL }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.detect.outputs.new_tag }}
+          OUTCOME: ${{ needs.attempt.outputs.outcome || 'release' }}
+          DETAIL: ${{ needs.attempt.outputs.detail || format('https://github.com/{0}/releases', inputs.upstream) }}
+        run: |
+          case "$OUTCOME" in
+            clean)     title="$REPO: $TAG clean";           prio=default; tags=white_check_mark ;;
+            dry-clean) title="$REPO: $TAG clean (dry run)"; prio=low;     tags=test_tube ;;
+            conflict)  title="$REPO: $TAG conflicts";       prio=high;    tags=warning ;;
+            skipped)   title="$REPO: $TAG PR already open"; prio=low;     tags=fast_forward ;;
+            release)   title="$REPO upstream: $TAG released"; prio=default; tags=package ;;
+          esac
+          curl -sf -H "Title: $title" -H "Priority: $prio" -H "Tags: $tags" -d "$DETAIL" "$NTFY_URL"
