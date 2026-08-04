@@ -20,17 +20,15 @@ jobs:
       has_new: ${{ steps.d.outputs.has_new }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          {
-            ref: "${{ inputs.mode != 'notify' && inputs.deploy_branch || github.event.repository.default_branch }}",
-          }
+        if: inputs.mode != 'notify'
+        with: { ref: '${{ inputs.deploy_branch }}' }
       - id: d
         env: { GH_TOKEN: '${{ github.token }}' }
         run: |
           latest=$(git ls-remote --tags --refs "https://github.com/${{ inputs.upstream }}.git" \
             | awk -F/ '{print $NF}' | grep -E '${{ inputs.tag_pattern }}' | sort -V | tail -1)
           if [ "${{ inputs.mode }}" = "notify" ]; then
-            current=$(gh variable get FORK_SYNC_LAST -R "$GITHUB_REPOSITORY" 2>/dev/null || echo "")
+            current=$(gh api "repos/$GITHUB_REPOSITORY/contents/LAST_TAG?ref=fork-sync-state" --jq .content 2>/dev/null | base64 -d || echo "")
           else
             current=$(cat '${{ inputs.base_marker }}')
           fi
@@ -104,7 +102,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - env: { GH_TOKEN: '${{ github.token }}' }
-        run: gh variable set FORK_SYNC_LAST -R "$GITHUB_REPOSITORY" --body '${{ needs.detect.outputs.new_tag }}'
+        run: |
+          set -e
+          R="$GITHUB_REPOSITORY"
+          TAG='${{ needs.detect.outputs.new_tag }}'
+          MSG="fork-sync: track $TAG"
+          if gh api "repos/$R/git/ref/heads/fork-sync-state" >/dev/null 2>&1; then
+            file_sha=$(gh api "repos/$R/contents/LAST_TAG?ref=fork-sync-state" --jq .sha)
+            content_b64=$(printf '%s' "$TAG" | base64 -w0)
+            gh api -X PUT "repos/$R/contents/LAST_TAG" \
+              -f message="$MSG" -f content="$content_b64" -f branch=fork-sync-state -f sha="$file_sha" >/dev/null
+          else
+            blob_sha=$(gh api -X POST "repos/$R/git/blobs" -f content="$TAG" -f encoding=utf-8 --jq .sha)
+            tree_sha=$(jq -n --arg sha "$blob_sha" \
+              '{tree: [{path: "LAST_TAG", mode: "100644", type: "blob", sha: $sha}]}' \
+              | gh api -X POST "repos/$R/git/trees" --input - --jq .sha)
+            commit_sha=$(jq -n --arg msg "$MSG" --arg tree "$tree_sha" \
+              '{message: $msg, tree: $tree, parents: []}' \
+              | gh api -X POST "repos/$R/git/commits" --input - --jq .sha)
+            gh api -X POST "repos/$R/git/refs" -f ref='refs/heads/fork-sync-state' -f sha="$commit_sha" >/dev/null
+          fi
 
   notify:
     needs: [detect, attempt, record]

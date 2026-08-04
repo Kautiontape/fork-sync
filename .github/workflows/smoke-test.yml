@@ -2,7 +2,7 @@ name: smoke-test
 on: workflow_dispatch
 jobs:
   smoke:
-    permissions: { contents: read, actions: write }
+    permissions: { contents: write }
     uses: ./.github/workflows/fork-sync.yml
     with:
       upstream: actualbudget/actual

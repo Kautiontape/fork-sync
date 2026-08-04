@@ -18,8 +18,10 @@ release, and sends a notification.
 
 For `rebase`/`merge`, "already synced up to" is tracked by a marker file
 (`base_marker`, default `.ktn-base`) committed on the deploy branch. For
-`notify`, it's tracked by a repository Actions variable, `FORK_SYNC_LAST`,
-since there's no deploy branch to commit a marker to.
+`notify`, it's tracked by a file, `LAST_TAG`, on an orphan branch,
+`fork-sync-state`, in the calling repo — created via the Git Data API with no
+parent commit and no connection to the repo's real history, since there's no
+deploy branch to commit a marker to.
 
 In all modes, detection compares against the newest upstream tag whose name
 matches `tag_pattern` (a `grep -E` pattern).
@@ -48,6 +50,18 @@ The `notify` job runs on the org's self-hosted runner
 private `NTFY_URL` endpoint; GitHub-hosted runners cannot. It only depends on
 `curl` — do not assume `gh` or other tooling is present on that runner.
 
+## Permissions
+
+The caller's `GITHUB_TOKEN` needs different permissions depending on `mode`,
+since all state (the `base_marker` file and the `notify`-mode `LAST_TAG` file)
+is written via `contents`, never via Actions variables/secrets (the default
+token can't write those under any permission grant):
+
+| Mode             | Required permissions                      |
+| ---------------- | ----------------------------------------- |
+| `rebase`/`merge` | `contents: write`, `pull-requests: write` |
+| `notify`         | `contents: write`                         |
+
 ## Caller template
 
 Add a thin workflow like this to each fork that wants to use `fork-sync`:
@@ -63,8 +77,7 @@ jobs:
   sync:
     permissions:
       contents: write
-      pull-requests: write
-      actions: write
+      pull-requests: write # omit for notify mode
     uses: Kautiontape/fork-sync/.github/workflows/fork-sync.yml@main
     with:
       upstream: <owner>/<repo>
