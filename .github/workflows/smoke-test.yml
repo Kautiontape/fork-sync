@@ -4,7 +4,7 @@ concurrency:
   { group: 'fork-sync-${{ github.repository }}', cancel-in-progress: false }
 jobs:
   smoke:
-    permissions: { contents: write }
+    permissions: { contents: write, pull-requests: write }
     uses: ./.github/workflows/fork-sync.yml
     with:
       upstream: actualbudget/actual

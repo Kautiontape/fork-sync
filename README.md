@@ -93,17 +93,22 @@ release announcement."
 
 ## Permissions
 
-The caller's `GITHUB_TOKEN` needs different permissions depending on `mode`,
-since all state (the `base_marker` file and the `notify`-mode `LAST_TAG`
-file) is written via `contents`, never via Actions variables/secrets (the
-default token can't write those under any permission grant). Each job inside
-`fork-sync` also declares its own minimal `permissions:`, so the caller's
-grant is only ever an upper bound:
+Every caller needs to grant **`contents: write, pull-requests: write`**,
+regardless of `mode`. This isn't mode-conditional: GitHub validates each
+job's declared `permissions:` inside `fork-sync` against what the caller
+granted at dispatch time, for every job in the file, before any `if:`
+condition is evaluated — so even in `notify` mode, where the `attempt` job
+never actually runs, its declared need for `pull-requests: write` still has
+to be satisfiable by the caller, or the whole run fails immediately with
+`startup_failure` ("invalid workflow file"). Under-granting is the most
+common way to break this workflow; there is no way to "downgrade" the grant
+per mode.
 
-| Mode             | Required permissions                      |
-| ---------------- | ----------------------------------------- |
-| `rebase`/`merge` | `contents: write`, `pull-requests: write` |
-| `notify`         | `contents: write`                         |
+Each job inside `fork-sync` still declares its own minimal `permissions:`
+internally (`detect: contents: read`, `attempt: contents: write,
+pull-requests: write`, `record: contents: write`, `notify: {}`) — so while
+every caller has to grant the same ceiling, each job's actual token is
+capped well below it.
 
 ## Caller template
 
@@ -123,7 +128,7 @@ jobs:
   sync:
     permissions:
       contents: write
-      pull-requests: write # omit for notify mode
+      pull-requests: write # required for all modes, see Permissions above
     uses: Kautiontape/fork-sync/.github/workflows/fork-sync.yml@main
     with:
       upstream: <owner>/<repo>
