@@ -52,7 +52,14 @@ jobs:
           esac
 
           if [ "$MODE" = "notify" ]; then
-            current=$(gh api "repos/$GITHUB_REPOSITORY/contents/LAST_TAG?ref=fork-sync-state" --jq .content 2>/dev/null | base64 -d || echo "")
+            # `gh api` still writes the JSON error body to stdout on a 404
+            # even with --jq, so check its own exit status first - piping
+            # that error body into base64 -d unguarded corrupts this output.
+            if body=$(gh api "repos/$GITHUB_REPOSITORY/contents/LAST_TAG?ref=fork-sync-state" 2>/dev/null); then
+              current=$(printf '%s' "$body" | jq -r .content | base64 -d)
+            else
+              current=""
+            fi
           else
             current=$(cat "$BASE_MARKER")
           fi
@@ -209,10 +216,21 @@ jobs:
           R="$GITHUB_REPOSITORY"
           MSG="fork-sync: track $TAG"
           if gh api "repos/$R/git/ref/heads/fork-sync-state" >/dev/null 2>&1; then
-            file_sha=$(gh api "repos/$R/contents/LAST_TAG?ref=fork-sync-state" --jq .sha)
+            # The branch may already exist (e.g. token_check created it for
+            # HEARTBEAT) without LAST_TAG on it yet - that 404 is normal,
+            # not a script-ending failure; only trust the sha on success.
+            file_sha=""
+            if raw_sha=$(gh api "repos/$R/contents/LAST_TAG?ref=fork-sync-state" --jq .sha 2>/dev/null); then
+              file_sha="$raw_sha"
+            fi
             content_b64=$(printf '%s' "$TAG" | base64 -w0)
-            gh api -X PUT "repos/$R/contents/LAST_TAG" \
-              -f message="$MSG" -f content="$content_b64" -f branch=fork-sync-state -f sha="$file_sha" >/dev/null
+            if [ -n "$file_sha" ]; then
+              gh api -X PUT "repos/$R/contents/LAST_TAG" \
+                -f message="$MSG" -f content="$content_b64" -f branch=fork-sync-state -f sha="$file_sha" >/dev/null
+            else
+              gh api -X PUT "repos/$R/contents/LAST_TAG" \
+                -f message="$MSG" -f content="$content_b64" -f branch=fork-sync-state >/dev/null
+            fi
           else
             blob_sha=$(gh api -X POST "repos/$R/git/blobs" -f content="$TAG" -f encoding=utf-8 --jq .sha)
             tree_sha=$(jq -n --arg sha "$blob_sha" \
@@ -257,7 +275,14 @@ jobs:
     steps:
       - id: tc
         env:
-          GH_TOKEN: ${{ secrets.SYNC_PR_TOKEN || github.token }}
+          # github.token always has contents:write on THIS repo (our own
+          # job permissions grant it) - used for every fork-sync-state
+          # read/write. SYNC_PR_TOKEN is deliberately scoped to the calling
+          # fork repos, not to fork-sync itself, so it's used ONLY for the
+          # one call that checks its own identity/expiry, never for writes
+          # against this repo.
+          GH_TOKEN: ${{ github.token }}
+          CHECK_TOKEN: ${{ secrets.SYNC_PR_TOKEN || github.token }}
           REPO: ${{ github.repository }}
           IS_SCHEDULE: ${{ github.event_name == 'schedule' }}
           LAST_SEEN: ${{ needs.detect.outputs.new_tag }}
@@ -277,14 +302,25 @@ jobs:
           fi
 
           get_state_file() { # $1=path
-            gh api "repos/$R/contents/$1?ref=fork-sync-state" --jq .content 2>/dev/null | base64 -d || true
+            # Same rule as detect: check gh's own exit status before ever
+            # piping a possible JSON error body into base64. Always return
+            # 0 (not-found is a normal outcome here, never a script-ending
+            # failure under set -e).
+            local body
+            if body=$(gh api "repos/$R/contents/$1?ref=fork-sync-state" 2>/dev/null); then
+              printf '%s' "$body" | jq -r .content | base64 -d
+            fi
+            return 0
           }
 
           put_state_file() { # $1=path $2=content $3=commit message
-            local b64 sha
+            local b64 sha raw
             b64=$(printf '%s' "$2" | base64 -w0)
             if [ "$state_exists" = true ]; then
-              sha=$(gh api "repos/$R/contents/$1?ref=fork-sync-state" --jq .sha 2>/dev/null || true)
+              sha=""
+              if raw=$(gh api "repos/$R/contents/$1?ref=fork-sync-state" --jq .sha 2>/dev/null); then
+                sha="$raw"
+              fi
               if [ -n "$sha" ]; then
                 gh api -X PUT "repos/$R/contents/$1" -f message="$3" -f content="$b64" -f branch=fork-sync-state -f sha="$sha" >/dev/null
               else
@@ -306,7 +342,7 @@ jobs:
 
           # --- token expiry check ---
           days=""
-          if ! resp=$(gh api -i user 2>&1); then
+          if ! resp=$(GH_TOKEN="$CHECK_TOKEN" gh api -i user 2>&1); then
             add_msg "$REPO: SYNC_PR_TOKEN check failed" high rotating_light \
               "Could not authenticate to check token expiry: $(printf '%s' "$resp" | tail -3 | tr '\n' ' ')"
           else
