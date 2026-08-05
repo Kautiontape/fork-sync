@@ -200,6 +200,31 @@ jobs:
           fi
           curl -sf -H "Title: $title" -H "Priority: $prio" -H "Tags: $tags" --data-raw "$DETAIL" "$NTFY_URL"
 
+  debug_record_gate:
+    needs: [detect, notify]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - env:
+          C1: ${{ inputs.mode == 'notify' }}
+          C2: ${{ needs.notify.result }}
+          C2B: ${{ needs.notify.result == 'success' }}
+          C3: ${{ needs.detect.outputs.has_new }}
+          C3B: ${{ needs.detect.outputs.has_new == 'true' }}
+          C4: ${{ inputs.dry_run }}
+          C4B: ${{ inputs.dry_run != true }}
+          COMBINED: ${{ inputs.mode == 'notify' && needs.notify.result == 'success' && needs.detect.outputs.has_new == 'true' && inputs.dry_run != true }}
+        run: |
+          echo "C1(mode==notify)=$C1"
+          echo "C2(notify.result)=$C2"
+          echo "C2B(notify.result==success)=$C2B"
+          echo "C3(has_new)=$C3"
+          echo "C3B(has_new==true)=$C3B"
+          echo "C4(dry_run)=$C4"
+          echo "C4B(dry_run!=true)=$C4B"
+          echo "COMBINED=$COMBINED"
+
   record:
     needs: [detect, notify]
     if: inputs.mode == 'notify' && needs.notify.result == 'success' && needs.detect.outputs.has_new == 'true' && inputs.dry_run != true
