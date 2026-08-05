@@ -1,5 +1,7 @@
 name: smoke-test
 on: workflow_dispatch
+concurrency:
+  { group: 'fork-sync-${{ github.repository }}', cancel-in-progress: false }
 jobs:
   smoke:
     permissions: { contents: write }
