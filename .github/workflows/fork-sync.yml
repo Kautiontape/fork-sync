@@ -35,8 +35,12 @@ jobs:
           BASE_MARKER: ${{ inputs.base_marker }}
         run: |
           set -eo pipefail
-          latest=$(git ls-remote --tags --refs "https://github.com/$UPSTREAM.git" \
-            | awk -F/ '{print $NF}' | grep -E -e "$TAG_PATTERN" | sort -V | tail -1)
+          # Staged so a real ls-remote/network failure (pipefail, aborts here)
+          # stays distinguishable from "fetched fine, nothing matched the
+          # pattern" (grep exit 1 is absorbed by `|| true`, not fatal).
+          tags=$(git ls-remote --tags --refs "https://github.com/$UPSTREAM.git" | awk -F/ '{print $NF}')
+          matched=$(printf '%s\n' "$tags" | { grep -E -e "$TAG_PATTERN" || true; })
+          latest=$(printf '%s\n' "$matched" | sort -V | tail -1)
 
           # Defense-in-depth: upstream tag names are hostile input. Reject
           # anything empty or containing characters that aren't safe to use
@@ -168,6 +172,8 @@ jobs:
           NTFY_URL: ${{ secrets.NTFY_URL }}
           REPO: ${{ github.repository }}
           TAG: ${{ needs.detect.outputs.new_tag }}
+          MODE: ${{ inputs.mode }}
+          DRY_RUN: ${{ inputs.dry_run }}
           OUTCOME: ${{ inputs.mode == 'notify' && 'release' || (needs.attempt.outputs.outcome || 'failed') }}
           DETAIL: ${{ needs.attempt.outputs.detail || format('https://github.com/{0}/releases', inputs.upstream) }}
         run: |
@@ -175,11 +181,16 @@ jobs:
             clean)     title="$REPO: $TAG clean";             prio=default; tags=white_check_mark ;;
             dry-clean) title="$REPO: $TAG clean (dry run)";   prio=low;     tags=test_tube ;;
             conflict)  title="$REPO: $TAG conflicts";         prio=high;    tags=warning ;;
-            skipped)   title="$REPO: $TAG PR already open";   prio=low;     tags=fast_forward ;;
+            skipped)   title="$REPO: $TAG PR already exists"; prio=low;     tags=fast_forward ;;
             release)   title="$REPO upstream: $TAG released"; prio=default; tags=package ;;
             failed)    title="$REPO: $TAG sync failed";       prio=high;    tags=rotating_light; DETAIL="sync job crashed — check the run" ;;
             *)         title="$REPO: $TAG sync failed";       prio=high;    tags=rotating_light; DETAIL="sync job crashed — check the run" ;;
           esac
+          # A notify-mode dry run would otherwise send an indistinguishable
+          # real-looking "released" ping.
+          if [ "$MODE" = "notify" ] && [ "$DRY_RUN" = "true" ] && [ "$OUTCOME" = "release" ]; then
+            title="[dry-run] $title"
+          fi
           curl -sf -H "Title: $title" -H "Priority: $prio" -H "Tags: $tags" --data-raw "$DETAIL" "$NTFY_URL"
 
   record:
@@ -212,3 +223,143 @@ jobs:
               | gh api -X POST "repos/$R/git/commits" --input - --jq .sha)
             gh api -X POST "repos/$R/git/refs" -f ref='refs/heads/fork-sync-state' -f sha="$commit_sha" >/dev/null
           fi
+
+  report_failure:
+    needs: [detect, attempt, notify, record]
+    if: ${{ failure() }}
+    runs-on: [self-hosted, ktn]
+    permissions: {}
+    timeout-minutes: 5
+    steps:
+      - env:
+          NTFY_URL: ${{ secrets.NTFY_URL }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          curl -sf -H "Title: $REPO: fork-sync FAILED" -H "Priority: high" -H "Tags: rotating_light" --data-raw "A fork-sync job failed. $RUN_URL" "$NTFY_URL"
+
+  # Runs on every invocation regardless of has_new/mode/success elsewhere:
+  # (1) warns before SYNC_PR_TOKEN expires, since a quiet stretch with no
+  #     new upstream release must not hide an expiring token; (2) refreshes
+  #     repo activity on fork-sync-state so GitHub doesn't auto-disable the
+  #     caller's scheduled workflow after 60 days of inactivity; (3) decides
+  #     whether a monthly "still alive" ping is due. Writes ONLY to the
+  #     orphan fork-sync-state branch, never to a deploy branch.
+  token_check:
+    needs: [detect, record]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    outputs:
+      messages: ${{ steps.tc.outputs.messages }}
+    steps:
+      - id: tc
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PR_TOKEN || github.token }}
+          REPO: ${{ github.repository }}
+          IS_SCHEDULE: ${{ github.event_name == 'schedule' }}
+          LAST_SEEN: ${{ needs.detect.outputs.new_tag }}
+        run: |
+          set -eo pipefail
+          R="$GITHUB_REPOSITORY"
+          msgs='[]'
+
+          add_msg() { # $1=title $2=priority $3=tags $4=body
+            msgs=$(jq -c --arg t "$1" --arg p "$2" --arg g "$3" --arg b "$4" \
+              '. + [{title:$t, prio:$p, tags:$g, body:$b}]' <<<"$msgs")
+          }
+
+          state_exists=false
+          if gh api "repos/$R/git/ref/heads/fork-sync-state" >/dev/null 2>&1; then
+            state_exists=true
+          fi
+
+          get_state_file() { # $1=path
+            gh api "repos/$R/contents/$1?ref=fork-sync-state" --jq .content 2>/dev/null | base64 -d || true
+          }
+
+          put_state_file() { # $1=path $2=content $3=commit message
+            local b64 sha
+            b64=$(printf '%s' "$2" | base64 -w0)
+            if [ "$state_exists" = true ]; then
+              sha=$(gh api "repos/$R/contents/$1?ref=fork-sync-state" --jq .sha 2>/dev/null || true)
+              if [ -n "$sha" ]; then
+                gh api -X PUT "repos/$R/contents/$1" -f message="$3" -f content="$b64" -f branch=fork-sync-state -f sha="$sha" >/dev/null
+              else
+                gh api -X PUT "repos/$R/contents/$1" -f message="$3" -f content="$b64" -f branch=fork-sync-state >/dev/null
+              fi
+            else
+              local blob_sha tree_sha commit_sha
+              blob_sha=$(gh api -X POST "repos/$R/git/blobs" -f content="$2" -f encoding=utf-8 --jq .sha)
+              tree_sha=$(jq -n --arg sha "$blob_sha" --arg path "$1" \
+                '{tree: [{path: $path, mode: "100644", type: "blob", sha: $sha}]}' \
+                | gh api -X POST "repos/$R/git/trees" --input - --jq .sha)
+              commit_sha=$(jq -n --arg msg "$3" --arg tree "$tree_sha" \
+                '{message: $msg, tree: $tree, parents: []}' \
+                | gh api -X POST "repos/$R/git/commits" --input - --jq .sha)
+              gh api -X POST "repos/$R/git/refs" -f ref='refs/heads/fork-sync-state' -f sha="$commit_sha" >/dev/null
+              state_exists=true
+            fi
+          }
+
+          # --- token expiry check ---
+          days=""
+          if ! resp=$(gh api -i user 2>&1); then
+            add_msg "$REPO: SYNC_PR_TOKEN check failed" high rotating_light \
+              "Could not authenticate to check token expiry: $(printf '%s' "$resp" | tail -3 | tr '\n' ' ')"
+          else
+            exp_val=$(printf '%s\n' "$resp" | tr -d '\r' | grep -i '^github-authentication-token-expiration:' | head -1 | cut -d: -f2- | sed 's/^ *//; s/ *$//')
+            if [ -z "$exp_val" ]; then
+              already_warned=$(get_state_file NO_EXPIRY_WARNED)
+              if [ -z "$already_warned" ]; then
+                add_msg "$REPO: token expiry can't be monitored" default hourglass \
+                  "SYNC_PR_TOKEN (or the default token) returned no expiration header - likely a classic or no-expiry token. fork-sync can't warn you before it dies. This is a one-time notice."
+                put_state_file NO_EXPIRY_WARNED "1" "fork-sync: note unmonitorable token expiry"
+              fi
+            else
+              exp_epoch=$(date -u -d "$exp_val" +%s)
+              now_epoch=$(date -u +%s)
+              days=$(( (exp_epoch - now_epoch) / 86400 ))
+              if [ "$days" -le 7 ]; then
+                add_msg "$REPO: SYNC_PR_TOKEN expires in $days days" high rotating_light "Token expires $exp_val. Rotate it soon."
+              elif [ "$days" -le 30 ]; then
+                add_msg "$REPO: SYNC_PR_TOKEN expires in $days days" default hourglass "Token expires $exp_val."
+              fi
+            fi
+          fi
+
+          # --- keepalive: any commit here refreshes repo activity, preventing
+          # GitHub's 60-day auto-disable of the caller's scheduled workflow ---
+          put_state_file HEARTBEAT "$(date -u +%FT%TZ)" "fork-sync: keepalive"
+
+          # --- monthly dead-man's-switch ping: only on the first scheduled
+          # run of the month, never on manual/testing dispatches ---
+          if [ "$IS_SCHEDULE" = "true" ] && [ "$(date -u +%d)" -le 7 ]; then
+            days_left="unmonitored"
+            [ -n "$days" ] && days_left="$days days"
+            add_msg "$REPO: fork-sync alive" low green_heart \
+              "Last-seen upstream tag: ${LAST_SEEN:-unknown}. SYNC_PR_TOKEN expiry: $days_left."
+          fi
+
+          echo "messages=$msgs" >> "$GITHUB_OUTPUT"
+
+  token_notify:
+    needs: token_check
+    if: ${{ !cancelled() && needs.token_check.outputs.messages != '' && needs.token_check.outputs.messages != '[]' }}
+    runs-on: [self-hosted, ktn]
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - env:
+          NTFY_URL: ${{ secrets.NTFY_URL }}
+          MESSAGES: ${{ needs.token_check.outputs.messages }}
+        run: |
+          echo "$MESSAGES" | jq -c '.[]' | while IFS= read -r m; do
+            title=$(jq -r '.title' <<<"$m")
+            prio=$(jq -r '.prio' <<<"$m")
+            tags=$(jq -r '.tags' <<<"$m")
+            body=$(jq -r '.body' <<<"$m")
+            curl -sf -H "Title: $title" -H "Priority: $prio" -H "Tags: $tags" --data-raw "$body" "$NTFY_URL"
+          done
