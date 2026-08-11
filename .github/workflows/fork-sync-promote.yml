@@ -57,10 +57,23 @@ jobs:
             '' | -* | *[!A-Za-z0-9._-]*) echo "unsafe tag: '$TAG'" >&2; exit 1 ;;
           esac
           BR="sync/$TAG"
-          git fetch --quiet origin "refs/heads/$BR:refs/remotes/origin/$BR" ||
-            { echo "branch $BR not found on origin" >&2; exit 1; }
-          head=$(git rev-parse "origin/$BR")
           expected=$(git rev-parse "origin/$DEPLOY_BRANCH")
+          if ! git fetch --quiet origin "refs/heads/$BR:refs/remotes/origin/$BR"; then
+            # No sync branch. A successful promote deletes it, so if the deploy
+            # branch already records this tag, this is a duplicate dispatch --
+            # succeed quietly rather than paging as a failure. Anything else
+            # (typo'd tag, branch never created) is still a real error.
+            deployed=$({ git show "origin/$DEPLOY_BRANCH:$BASE_MARKER" 2>/dev/null || true; } | head -n1)
+            if [ "$deployed" = "$TAG" ]; then
+              echo "$BR is gone and $DEPLOY_BRANCH already records $TAG - already promoted"
+              echo "outcome=already-promoted" >> "$GITHUB_OUTPUT"
+              echo "detail=$DEPLOY_BRANCH ($expected) already records $TAG; nothing to do" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "branch $BR not found on origin, and $DEPLOY_BRANCH records '$deployed' - nothing to promote" >&2
+            exit 1
+          fi
+          head=$(git rev-parse "origin/$BR")
 
           # The branch must be a rebase product built for exactly this tag.
           marker=$({ git show "origin/$BR:$BASE_MARKER" 2>/dev/null || true; } | head -n1)
@@ -143,8 +156,9 @@ jobs:
           DETAIL: ${{ needs.promote.outputs.detail || 'promote refused or crashed - check the run' }}
         run: |
           case "$OUTCOME" in
-            promoted)    title="$REPO: $TAG promoted";         prio=default; tags=rocket ;;
-            dry-promote) title="$REPO: $TAG promotable (dry)"; prio=low;     tags=test_tube ;;
-            *)           title="$REPO: $TAG promote FAILED";   prio=high;    tags=rotating_light ;;
+            promoted)         title="$REPO: $TAG promoted";         prio=default; tags=rocket ;;
+            already-promoted) title="$REPO: $TAG already promoted"; prio=low;     tags=information_source ;;
+            dry-promote)      title="$REPO: $TAG promotable (dry)"; prio=low;     tags=test_tube ;;
+            *)                title="$REPO: $TAG promote FAILED";   prio=high;    tags=rotating_light ;;
           esac
           curl -sf -H "Title: $title" -H "Priority: $prio" -H "Tags: $tags" --data-raw "$DETAIL" "$NTFY_URL"

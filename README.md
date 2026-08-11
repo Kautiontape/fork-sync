@@ -8,7 +8,9 @@ release, and sends a notification.
 
 - **`rebase`** — replays the fork's carried patches (commits unique to the
   deploy branch, not already present upstream) on top of the new upstream tag
-  via `git cherry-pick`, then opens a PR against the deploy branch.
+  via `git cherry-pick`, then opens a PR against the deploy branch. That PR is
+  **not** merged with the merge button — see
+  [Promoting a rebase sync](#promoting-a-rebase-sync).
 - **`merge`** — merges the new upstream tag directly into the deploy branch
   (`git merge --no-ff`) on a new branch, then opens a PR against the deploy
   branch.
@@ -215,6 +217,103 @@ if configured) through automatically — no per-repo secret configuration
 needed beyond adding `SYNC_PR_TOKEN` itself where wanted. The `concurrency`
 block prevents overlapping runs (e.g. a manual dispatch racing the schedule)
 from stepping on the same branch/marker.
+
+## Promoting a rebase sync
+
+`.github/workflows/fork-sync-promote.yml` is the integration step for
+`rebase`-mode syncs, dispatched by hand once the sync branch's checks are
+green. It is a separate reusable workflow with its own thin caller.
+
+A rebase sync branch is the deploy branch _rebuilt_ onto a newer upstream tag,
+so it has to **replace** the deploy branch wholesale. Merging it would weave
+both histories together, and every carried patch would then appear twice in
+the next sync's carry list. The sync PR also conflicts on the marker file by
+construction — both sides changed it from different bases — so GitHub's merge
+button is unusable anyway. That is deliberate, not a bug to work around.
+
+Promote instead: it verifies the branch's check runs, force-pushes it over the
+deploy branch with a lease, waits for GitHub's indirect-merge detection to
+flip the sync PR to merged (the head commits become reachable from the base),
+then deletes the sync branch.
+
+### Inputs
+
+| Input           | Required | Type    | Default     | Description                                        |
+| --------------- | -------- | ------- | ----------- | -------------------------------------------------- |
+| `tag`           | yes      | string  | —           | Upstream tag whose `sync/<tag>` branch to promote. |
+| `base_marker`   | no       | string  | `.ktn-base` | Marker file to cross-check against `tag`.          |
+| `deploy_branch` | no       | string  | `ktn`       | Branch to replace.                                 |
+| `dry_run`       | no       | boolean | `false`     | Verify and report only — push nothing.             |
+
+Grant `contents: write`. `NTFY_URL` is required; `SYNC_PR_TOKEN` is optional
+but **effectively required** — a push made with `github.token` never starts
+workflow runs, so the deploy branch's build and deploy would silently not
+fire. Without it the run logs a `::warning::` saying exactly that, and you
+have to trigger the deploy by hand.
+
+Use the **same concurrency group as the repo's `fork-sync` caller**
+(`fork-sync-${{ github.repository }}`) so a promote can never race a running
+sync attempt. A top-level `concurrency:` block inside the reusable workflow
+would be ignored — it only takes effect in the caller.
+
+```yaml
+name: fork-sync promote
+on:
+  workflow_dispatch:
+    inputs:
+      tag: { type: string, required: true }
+      dry_run: { type: boolean, default: false }
+
+concurrency:
+  { group: 'fork-sync-${{ github.repository }}', cancel-in-progress: false }
+
+permissions:
+  contents: write
+
+jobs:
+  promote:
+    uses: Kautiontape/fork-sync/.github/workflows/fork-sync-promote.yml@main
+    with:
+      tag: ${{ inputs.tag }}
+      dry_run: ${{ inputs.dry_run }}
+    secrets: inherit
+```
+
+### Outcomes
+
+| `outcome`          | Exit | ntfy priority | When                                                      |
+| ------------------ | ---- | ------------- | --------------------------------------------------------- |
+| `promoted`         | 0    | default       | Deploy branch replaced.                                   |
+| `already-promoted` | 0    | low           | Nothing to do — this tag is already on the deploy branch. |
+| `dry-promote`      | 0    | low           | `dry_run: true` and the branch is promotable.             |
+| (none — refused)   | 1    | high          | Any guard below fired.                                    |
+
+`already-promoted` is the duplicate-dispatch case: a successful promote
+deletes the sync branch, so a second dispatch finds nothing. Rather than
+treat that as a failure, the workflow cross-checks the deploy branch's marker
+— if it already reads the requested tag, the work is genuinely done, so it
+exits 0 with a quiet ping instead of paging. A missing sync branch whose tag
+does **not** match the marker is still a hard error.
+
+### Refusals
+
+Every guard runs before anything is pushed, in this order:
+
+| Message                                        | Meaning                                                                                                                                 |
+| ---------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `unsafe tag: '<tag>'`                          | Same hostile-input rule as `detect` — the tag reaches git refs and shell strings.                                                       |
+| `branch sync/<tag> not found ... records 'X'`  | No sync branch, and the marker disagrees — a typo'd tag, or the sync never ran. (When the marker agrees, see `already-promoted` above.) |
+| `<marker> on sync/<tag> reads 'X', expected …` | The branch was built for a different tag — wrong `tag` input.                                                                           |
+| `no check runs on <branch>@<sha>`              | The gate never fired. The branch predates a push-triggered gate, or was pushed with `github.token`. Promoting is refused.               |
+| `N check run(s) still in progress`             | Wait for the gate, then re-dispatch.                                                                                                    |
+| `not green: <name> -> <conclusion>`            | A check failed. `continue-on-error` jobs report success, so a caller's non-blocking jobs stay non-blocking here too.                    |
+
+Because `notify` runs on `!cancelled()` and reads no outputs from a failed
+`promote`, every refusal above sends the same high-priority `rotating_light`
+ping titled `<repo>: <tag> promote FAILED` — it cannot say which guard fired,
+so read the run log before treating one as an incident. The one formerly
+benign case, a duplicate dispatch, is now `already-promoted` and no longer
+pages at all.
 
 ## Smoke test
 
