@@ -93,6 +93,10 @@ jobs:
       - id: sync
         env:
           GH_TOKEN: ${{ secrets.SYNC_PR_TOKEN || github.token }}
+          # We add an `upstream` remote below, and gh infers its base repo
+          # from remotes, preferring `upstream` over `origin` - so `gh pr`
+          # would target the upstream project instead of this fork. Pin it.
+          GH_REPO: ${{ github.repository }}
           HAS_PR_TOKEN: ${{ secrets.SYNC_PR_TOKEN != '' }}
           NEW: ${{ needs.detect.outputs.new_tag }}
           CUR: ${{ needs.detect.outputs.current }}
