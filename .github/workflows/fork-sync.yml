@@ -154,9 +154,33 @@ jobs:
               echo "detail=clean (dry run, not pushed)" >> "$GITHUB_OUTPUT"
             else
               git push -f origin "$BR"
-              body="Automated $MODE of carried patches onto $NEW. Build gate runs on this PR. Merging deploys."
+              if [ "$MODE" = "rebase" ]; then
+                # A rebase-mode sync branch IS the deploy branch rebuilt on
+                # the new tag - it must REPLACE it, never be merged into it
+                # (a merge weaves both histories together and doubles every
+                # carried patch in the next sync's carry list). The marker
+                # file conflicts by construction, which keeps the merge
+                # button disabled - and, per GitHub's documented behavior,
+                # conflicted PRs never run pull_request workflows, so the
+                # build gate must trigger on push to this branch instead.
+                body=$(printf '%s\n' \
+                  "Automated rebase of carried patches onto $NEW." \
+                  "" \
+                  "DO NOT use the merge button. This branch replaces $DEPLOY_BRANCH wholesale; a merge would weave the old and rebased histories together and double every carried patch in the next sync. The $BASE_MARKER conflict is intentional - it keeps the button disabled. (Conflicted PRs also never run pull_request checks; the gate runs on push to this branch.)" \
+                  "" \
+                  "Promote once checks are green - GitHub will then mark this PR merged automatically:" \
+                  "" \
+                  "    gh workflow run <your fork-sync-promote caller> -f tag=$NEW" \
+                  "" \
+                  "or by hand:" \
+                  "" \
+                  "    git fetch origin $BR $DEPLOY_BRANCH" \
+                  "    git push --force-with-lease origin origin/$BR:$DEPLOY_BRANCH")
+              else
+                body="Automated merge of $NEW. Build gate runs on this PR. Merging deploys."
+              fi
               if [ "$HAS_PR_TOKEN" != "true" ]; then
-                warn="⚠️ No SYNC_PR_TOKEN configured — if this branch touches .github/workflows/*.yml, checks will not auto-run. Close and reopen this PR to trigger them."
+                warn="⚠️ No SYNC_PR_TOKEN configured — this branch was pushed with the workflow's GITHUB_TOKEN, and GITHUB_TOKEN events never start workflow runs, so no checks fired on it. Dispatch your gate workflow against $BR manually. (Close/reopen only re-triggers mergeable PRs — it cannot help a conflicted rebase-mode PR.)"
                 body=$(printf '%s\n\n%s' "$body" "$warn")
               fi
               url=$(gh pr create --base "$DEPLOY_BRANCH" --head "$BR" --title "ktn: sync $NEW" --body "$body")
@@ -164,7 +188,7 @@ jobs:
               if [ "$HAS_PR_TOKEN" = "true" ]; then
                 echo "detail=$url" >> "$GITHUB_OUTPUT"
               else
-                echo "detail=$url (checks will not auto-run — close/reopen the PR to trigger them)" >> "$GITHUB_OUTPUT"
+                echo "detail=$url (no PAT: checks did not auto-run — dispatch the gate manually)" >> "$GITHUB_OUTPUT"
               fi
             fi
           else

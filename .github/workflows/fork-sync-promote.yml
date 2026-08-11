@@ -1,0 +1,150 @@
+name: fork-sync promote
+# Integration step for REBASE-mode syncs. The sync branch is the deploy
+# branch rebuilt onto a newer upstream tag, so it must REPLACE the deploy
+# branch wholesale — merging it would weave both histories together and
+# double every carried patch in the next sync's carry list. This verifies
+# the branch's gate checks and force-pushes it over the deploy branch;
+# GitHub's indirect-merge detection then marks the open sync PR as merged
+# (the head commits become reachable from the base).
+#
+# Callers should use the same concurrency group as their fork-sync caller
+# (group: fork-sync-${{ github.repository }}) so a promote can never race
+# a running sync attempt — top-level concurrency here would be ignored,
+# it only takes effect in the caller.
+on:
+  workflow_call:
+    inputs:
+      tag: { required: true, type: string } # upstream tag whose sync/<tag> branch to promote
+      base_marker: { required: false, type: string, default: '.ktn-base' }
+      deploy_branch: { required: false, type: string, default: 'ktn' }
+      dry_run: { required: false, type: boolean, default: false }
+    secrets:
+      NTFY_URL: { required: true }
+      # Effectively required: a promote push made with github.token cannot
+      # start the deploy branch's workflows (GITHUB_TOKEN events never
+      # create workflow runs), so the deploy would silently not happen.
+      SYNC_PR_TOKEN: { required: false }
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    outputs:
+      outcome: ${{ steps.p.outputs.outcome }}
+      detail: ${{ steps.p.outputs.detail }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.deploy_branch }}
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_PR_TOKEN || github.token }}
+      - id: p
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PR_TOKEN || github.token }}
+          GH_REPO: ${{ github.repository }} # never let gh infer the repo from remotes
+          HAS_PR_TOKEN: ${{ secrets.SYNC_PR_TOKEN != '' }}
+          TAG: ${{ inputs.tag }}
+          BASE_MARKER: ${{ inputs.base_marker }}
+          DEPLOY_BRANCH: ${{ inputs.deploy_branch }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -eo pipefail
+          # Same hostile-input rule as detect: the tag reaches git refs and
+          # shell strings below.
+          case "$TAG" in
+            '' | -* | *[!A-Za-z0-9._-]*) echo "unsafe tag: '$TAG'" >&2; exit 1 ;;
+          esac
+          BR="sync/$TAG"
+          git fetch --quiet origin "refs/heads/$BR:refs/remotes/origin/$BR" ||
+            { echo "branch $BR not found on origin" >&2; exit 1; }
+          head=$(git rev-parse "origin/$BR")
+          expected=$(git rev-parse "origin/$DEPLOY_BRANCH")
+
+          # The branch must be a rebase product built for exactly this tag.
+          marker=$({ git show "origin/$BR:$BASE_MARKER" 2>/dev/null || true; } | head -n1)
+          if [ "$marker" != "$TAG" ]; then
+            echo "$BASE_MARKER on $BR reads '$marker', expected '$TAG' - refusing" >&2
+            exit 1
+          fi
+
+          # Refuse to promote an ungated branch. Zero check runs means the
+          # gate never fired (e.g. the branch predates the push-triggered
+          # gate, or it was pushed with github.token, whose events never
+          # start workflow runs); anything pending or red means it fired
+          # and hasn't passed. Note continue-on-error jobs report success,
+          # so a caller's non-blocking jobs stay non-blocking here too.
+          checks=$(gh api "repos/$GITHUB_REPOSITORY/commits/$head/check-runs" \
+            --paginate --jq '[.check_runs[] | {name, status, conclusion}]' | jq -s 'add // []')
+          total=$(jq length <<<"$checks")
+          pending=$(jq '[.[] | select(.status != "completed")] | length' <<<"$checks")
+          failed=$(jq '[.[] | select(.status == "completed"
+            and .conclusion != "success" and .conclusion != "neutral"
+            and .conclusion != "skipped")] | length' <<<"$checks")
+          if [ "$total" = "0" ]; then
+            echo "no check runs on $BR@$head - the gate never ran; trigger it first" >&2
+            exit 1
+          fi
+          if [ "$pending" != "0" ]; then
+            echo "$pending check run(s) still in progress on $BR@$head - wait for the gate" >&2
+            exit 1
+          fi
+          if [ "$failed" != "0" ]; then
+            jq -r '.[] | select(.status == "completed"
+              and .conclusion != "success" and .conclusion != "neutral"
+              and .conclusion != "skipped") | "not green: \(.name) -> \(.conclusion)"' <<<"$checks" >&2
+            exit 1
+          fi
+
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "outcome=dry-promote" >> "$GITHUB_OUTPUT"
+            echo "detail=would replace $DEPLOY_BRANCH ($expected) with $BR ($head); $total checks green" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$HAS_PR_TOKEN" != "true" ]; then
+            echo "::warning::pushing with github.token - its events never start workflow runs, so the deploy branch's workflows will NOT fire; trigger the deploy manually"
+          fi
+
+          git push --force-with-lease="refs/heads/$DEPLOY_BRANCH:$expected" \
+            origin "$head:refs/heads/$DEPLOY_BRANCH"
+
+          # Indirect-merge detection flips the sync PR to merged once the
+          # head commits are reachable from the base. Wait for it before
+          # deleting the branch so the PR records as merged, not closed.
+          merged=false
+          for _ in 1 2 3 4 5 6; do
+            n=$(gh pr list --head "$BR" --state merged --json number --jq length)
+            if [ "$n" != "0" ]; then merged=true; break; fi
+            sleep 5
+          done
+          if [ "$merged" = true ]; then
+            git push origin ":refs/heads/$BR" || true
+            echo "outcome=promoted" >> "$GITHUB_OUTPUT"
+            echo "detail=$DEPLOY_BRANCH is now $BR@$head; PR marked merged; branch deleted" >> "$GITHUB_OUTPUT"
+          else
+            echo "outcome=promoted" >> "$GITHUB_OUTPUT"
+            echo "detail=$DEPLOY_BRANCH is now $BR@$head; PR not yet marked merged - branch left in place" >> "$GITHUB_OUTPUT"
+          fi
+
+  notify:
+    needs: promote
+    if: ${{ !cancelled() }}
+    runs-on: [self-hosted, ktn]
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - env:
+          NTFY_URL: ${{ secrets.NTFY_URL }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+          OUTCOME: ${{ needs.promote.outputs.outcome || 'failed' }}
+          DETAIL: ${{ needs.promote.outputs.detail || 'promote refused or crashed - check the run' }}
+        run: |
+          case "$OUTCOME" in
+            promoted)    title="$REPO: $TAG promoted";         prio=default; tags=rocket ;;
+            dry-promote) title="$REPO: $TAG promotable (dry)"; prio=low;     tags=test_tube ;;
+            *)           title="$REPO: $TAG promote FAILED";   prio=high;    tags=rotating_light ;;
+          esac
+          curl -sf -H "Title: $title" -H "Priority: $prio" -H "Tags: $tags" --data-raw "$DETAIL" "$NTFY_URL"
