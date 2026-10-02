@@ -1,0 +1,12 @@
+name: ci
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    uses: Kautiontape/ci/.github/workflows/actionlint.yml@main
