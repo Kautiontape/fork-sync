@@ -35,7 +35,7 @@ jobs:
       outcome: ${{ steps.p.outputs.outcome }}
       detail: ${{ steps.p.outputs.detail }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.deploy_branch }}
           fetch-depth: 0
