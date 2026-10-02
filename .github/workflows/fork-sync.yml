@@ -23,7 +23,7 @@ jobs:
       current: ${{ steps.d.outputs.current }}
       has_new: ${{ steps.d.outputs.has_new }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         if: inputs.mode != 'notify'
         with: { ref: '${{ inputs.deploy_branch }}' }
       - id: d
@@ -85,7 +85,7 @@ jobs:
       outcome: ${{ steps.sync.outputs.outcome }}
       detail: ${{ steps.sync.outputs.detail }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.deploy_branch }}
           fetch-depth: 0
