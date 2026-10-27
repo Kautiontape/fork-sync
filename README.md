@@ -315,6 +315,38 @@ so read the run log before treating one as an incident. The one formerly
 benign case, a duplicate dispatch, is now `already-promoted` and no longer
 pages at all.
 
+## Workflow guard
+
+A fork carries every workflow file upstream has. Unless they are turned off, upstream's nightlies, CodeQL, release and test jobs run on the fork's Actions minutes. On 2026-10-27, GitHub turned off Actions on `Kautiontape/trilium` over this kind of usage, and while it was off, merges to `ktn` silently didn't deploy. A disabled workflow stays disabled when its file changes. But when an upstream sync brings in a new workflow file, it arrives active.
+
+`workflow-guard.yml` disables every active workflow whose file name doesn't match `keep`, a `grep -E` pattern that defaults to `^ktn-`. It skips GitHub's dynamic workflows, such as CodeQL default setup and Pages, which have no file under `.github/workflows/`. It needs only `actions: write`, which `GITHUB_TOKEN` grants, and writes what it kept and disabled to the run summary. Add this caller to each fork as `.github/workflows/ktn-workflow-guard.yml`. The `ktn-` prefix keeps the guard itself on.
+
+```yaml
+name: ktn workflow guard
+on:
+  push:
+    branches: [ktn] # the fork's deploy branch
+    paths: ['.github/workflows/**']
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      dry_run: { type: boolean, default: true }
+
+jobs:
+  guard:
+    permissions:
+      actions: write
+    uses: Kautiontape/fork-sync/.github/workflows/workflow-guard.yml@main
+    with:
+      dry_run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+```
+
+- **Triggers.** The push trigger runs the guard as soon as a sync merge changes a workflow file. The weekly run catches anything else.
+- **Window.** A new upstream workflow that triggers on that same push, or on the sync PR itself, can still run once before the guard turns it off.
+- **Own workflows.** A fork whose own workflows aren't named `ktn-*` passes `keep`, for example `'^(ktn-|build-publish\.yml$|deploy-ktn\.yml$)'`.
+- **Re-enabling.** To keep an upstream workflow on, add it to `keep`. Otherwise the guard turns it off again on its next run.
+
 ## Smoke test
 
 `.github/workflows/smoke-test.yml` runs `fork-sync` in `notify` mode against
