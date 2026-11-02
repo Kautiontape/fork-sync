@@ -1,0 +1,55 @@
+name: workflow-guard
+# Disables every active workflow in the calling fork whose file name doesn't
+# match `keep`. Upstream's own workflows (nightlies, CodeQL, release and test
+# jobs) otherwise run on the fork's minutes, and an upstream sync that adds a
+# new workflow file brings it in active. See README, "Workflow guard".
+on:
+  workflow_call:
+    inputs:
+      keep: { required: false, type: string, default: '^ktn-' } # grep -E on the file name
+      dry_run: { required: false, type: boolean, default: false }
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          KEEP: ${{ inputs.keep }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -eo pipefail
+          gh api --paginate "repos/$REPO/actions/workflows?per_page=100" \
+            --jq '.workflows[] | select(.state == "active") | "\(.id) \(.path)"' > active.txt
+          kept=0
+          disabled=0
+          {
+            echo "### Workflow guard"
+            echo
+            echo "Keeping file names matching \`$KEEP\`."
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+          while read -r id wf_path; do
+            file="${wf_path##*/}"
+            # Dynamic entries (Dependabot, CodeQL default setup, Pages) have
+            # no file of ours under .github/workflows; leave them alone.
+            case "$wf_path" in .github/workflows/*) ;; *) continue ;; esac
+            if grep -Eq -- "$KEEP" <<< "$file"; then
+              kept=$((kept + 1))
+              continue
+            fi
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "- would disable \`$file\`" >> "$GITHUB_STEP_SUMMARY"
+            else
+              gh api -X PUT "repos/$REPO/actions/workflows/$id/disable"
+              echo "- disabled \`$file\`" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            disabled=$((disabled + 1))
+          done < active.txt
+          echo >> "$GITHUB_STEP_SUMMARY"
+          echo "Kept $kept, disabled $disabled (dry run: $DRY_RUN)." >> "$GITHUB_STEP_SUMMARY"
+          echo "kept=$kept disabled=$disabled dry_run=$DRY_RUN"
