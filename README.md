@@ -56,6 +56,7 @@ later runs. To re-attempt a version you previously rejected, delete the
 | `tag_pattern`   | yes      | string  | —           | `grep -E` pattern used to pick the newest matching upstream tag.                                          |
 | `base_marker`   | no       | string  | `.ktn-base` | Path to the marker file that records the last-synced tag (rebase/merge only, must pre-exist — see above). |
 | `deploy_branch` | no       | string  | `ktn`       | Branch that PRs target and that the marker file lives on.                                                 |
+| `keep`          | no       | string  | `^ktn-`     | `grep -E` on file names: upstream workflow files to carry. The rest are dropped — see below.              |
 | `dry_run`       | no       | boolean | `false`     | For rebase/merge: do the sync locally but don't push or open a PR.                                        |
 
 ## Secrets
@@ -315,9 +316,21 @@ so read the run log before treating one as an incident. The one formerly
 benign case, a duplicate dispatch, is now `already-promoted` and no longer
 pages at all.
 
+## Upstream workflows
+
+A fork inherits every workflow file upstream has. Unless they are turned off, upstream's nightlies, CodeQL, release and test jobs run on the fork's Actions minutes. GitHub turned off workflows on `Kautiontape/trilium` on 2026-10-27 over this kind of usage. It did so again by 2026-11-16, although the only upstream workflow to run in between was one 12-second run on a sync PR; GitHub doesn't say what its check counts. While workflows are off, merges to `ktn` silently don't build or deploy.
+
+So in `rebase` and `merge` mode the sync branch carries none of them. After the merge or the cherry-picks, `attempt` removes every top-level workflow file in the upstream tag whose name doesn't match `keep`, and the PR body lists what it dropped. Only names from the tag's tree are candidates, so the fork's own workflows stay, whatever they are called.
+
+- **Merge mode.** The removal happens inside the merge, before it is committed. Once the deploy branch has dropped a file, upstream's later edits to it raise a modify/delete conflict, and the removal resolves it. Only conflicts in other files fail the sync.
+- **Rebase mode.** The removal is its own commit, `ktn: drop upstream workflows (<tag>)`. The next sync leaves it out of the carry list and makes a new one from the new tag.
+- **Keeping one.** To carry an upstream workflow, add its file name to `keep`, and pass the guard the same pattern.
+- **Subfolders.** Files under `.github/workflows/<dir>/` stay; GitHub only runs top-level workflow files.
+- **Token.** A push that changes workflow files needs `Workflows` write. `SYNC_PR_TOKEN` already needs it for upstream's own workflow edits.
+
 ## Workflow guard
 
-A fork carries every workflow file upstream has. Unless they are turned off, upstream's nightlies, CodeQL, release and test jobs run on the fork's Actions minutes. On 2026-10-27, GitHub turned off Actions on `Kautiontape/trilium` over this kind of usage, and while it was off, merges to `ktn` silently didn't deploy. A disabled workflow stays disabled when its file changes. But when an upstream sync brings in a new workflow file, it arrives active.
+The guard covers what the sync doesn't: `notify`-mode forks, upstream code merged by hand, and upstream workflows already on the deploy branch. A disabled workflow stays disabled when its file changes, but a new workflow file arrives active.
 
 `workflow-guard.yml` disables every active workflow whose file name doesn't match `keep`, a `grep -E` pattern that defaults to `^ktn-`. It skips GitHub's dynamic workflows, such as CodeQL default setup and Pages, which have no file under `.github/workflows/`. It needs only `actions: write`, which `GITHUB_TOKEN` grants, and writes what it kept and disabled to the run summary. Add this caller to each fork as `.github/workflows/ktn-workflow-guard.yml`. The `ktn-` prefix keeps the guard itself on.
 
@@ -343,9 +356,9 @@ jobs:
 ```
 
 - **Triggers.** The push trigger runs the guard as soon as a sync merge changes a workflow file. The weekly run catches anything else.
-- **Window.** A new upstream workflow that triggers on that same push, or on the sync PR itself, can still run once before the guard turns it off.
+- **Window.** Sync PRs no longer bring upstream workflows in. On a hand merge or a `notify`-mode fork, a new upstream workflow that triggers on that same push or PR can still run once before the guard turns it off.
 - **Own workflows.** A fork whose own workflows aren't named `ktn-*` passes `keep`, for example `'^(ktn-|build-publish\.yml$|deploy-ktn\.yml$)'`.
-- **Re-enabling.** To keep an upstream workflow on, add it to `keep`. Otherwise the guard turns it off again on its next run.
+- **Re-enabling.** To keep an upstream workflow on, add it to `keep`, here and in the sync caller. Otherwise the guard turns it off again on its next run.
 
 ## Smoke test
 
