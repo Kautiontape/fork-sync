@@ -7,6 +7,7 @@ on:
       tag_pattern: { required: true, type: string } # grep -E pattern for release tags
       base_marker: { required: false, type: string, default: '.ktn-base' }
       deploy_branch: { required: false, type: string, default: 'ktn' }
+      keep: { required: false, type: string, default: '^ktn-' } # grep -E on upstream workflow file names to carry
       dry_run: { required: false, type: boolean, default: false }
     secrets:
       NTFY_URL: { required: true }
@@ -104,11 +105,32 @@ jobs:
           UPSTREAM: ${{ inputs.upstream }}
           BASE_MARKER: ${{ inputs.base_marker }}
           DEPLOY_BRANCH: ${{ inputs.deploy_branch }}
+          KEEP: ${{ inputs.keep }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -e
           git config user.name ktn-bot
           git config user.email ktn-bot@users.noreply.github.com
+
+          # Upstream's workflows never ride along to the fork (README, "Upstream
+          # workflows"): drop every top-level workflow file the upstream tag
+          # ships unless its name matches KEEP. Only names from the tag's tree
+          # are candidates, so the fork's own workflows are never touched. In
+          # merge mode this also resolves the modify/delete conflicts that
+          # upstream edits to an already-dropped file raise.
+          : > /tmp/stripped.txt
+          strip_upstream_workflows() {
+            git ls-tree -z --name-only "$NEW" -- .github/workflows/ |
+              while IFS= read -r -d '' f; do
+                case "$f" in .github/workflows/*/*) continue ;; *.yml | *.yaml) ;; *) continue ;; esac
+                if grep -Eq -- "$KEEP" <<< "${f##*/}"; then continue; fi
+                if git ls-files --error-unmatch -- "$f" >/dev/null 2>&1; then
+                  git rm -q -f -- "$f"
+                  echo "$f" >> /tmp/stripped.txt
+                fi
+              done
+          }
+
           git remote add upstream "https://github.com/$UPSTREAM.git"
           # Fetch only the two tags we need. NEW must exist; tolerate CUR
           # having been deleted upstream (merge mode doesn't need it, and a
@@ -127,7 +149,10 @@ jobs:
 
           ok=true
           if [ "$MODE" = "rebase" ]; then
-            git rev-list --reverse --no-merges HEAD --not "$CUR" "$NEW" > /tmp/carry.txt
+            # The previous sync's strip commit is rebuilt from the new tag
+            # below, so it is never carried.
+            git rev-list --reverse --no-merges --invert-grep --grep='^ktn: drop upstream workflows (' \
+              HEAD --not "$CUR" "$NEW" > /tmp/carry.txt
             git checkout -B "$BR" "$NEW"
             while read -r c; do
               if ! git cherry-pick -x --empty=drop "$c" >/dev/null 2>&1; then
@@ -136,12 +161,30 @@ jobs:
                 ok=false; break
               fi
             done < /tmp/carry.txt
+            if [ "$ok" = true ]; then
+              strip_upstream_workflows
+              if ! git diff --cached --quiet; then
+                git commit -q -m "ktn: drop upstream workflows ($NEW)"
+              fi
+            fi
           else
             git checkout -B "$BR"
-            if ! git merge --no-ff --no-edit "$NEW"; then
+            rc=0
+            git merge --no-ff --no-commit "$NEW" || rc=$?
+            if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+              strip_upstream_workflows
               files=$(git diff --name-only --diff-filter=U | tr '\n' ' ')
-              git merge --abort || true
+              if [ -n "$files" ]; then
+                git merge --abort || true
+                ok=false
+              else
+                git commit -q --no-edit --cleanup=strip
+              fi
+            elif [ "$rc" -ne 0 ]; then
+              files="(merge did not start; see the run log)"
               ok=false
+            else
+              strip_upstream_workflows # already up to date: the marker commit carries it
             fi
           fi
 
@@ -178,6 +221,11 @@ jobs:
                   "    git push --force-with-lease origin origin/$BR:$DEPLOY_BRANCH")
               else
                 body="Automated merge of $NEW. Build gate runs on this PR. Merging deploys."
+              fi
+              if [ -s /tmp/stripped.txt ]; then
+                body=$(printf '%s\n\n%s\n\n%s' "$body" \
+                  "Dropped $(wc -l < /tmp/stripped.txt) upstream workflow file(s); only names matching \`$KEEP\` are carried:" \
+                  "$(sed 's/^/- /' /tmp/stripped.txt)")
               fi
               if [ "$HAS_PR_TOKEN" != "true" ]; then
                 warn="⚠️ No SYNC_PR_TOKEN configured — this branch was pushed with the workflow's GITHUB_TOKEN, and GITHUB_TOKEN events never start workflow runs, so no checks fired on it. Dispatch your gate workflow against $BR manually. (Close/reopen only re-triggers mergeable PRs — it cannot help a conflicted rebase-mode PR.)"
